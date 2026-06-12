@@ -1,5 +1,11 @@
-# p2pshare
-P2P File Share with Security
+<p align="center">
+  <img width="256" height="256" src="./assets/logo.png" />
+</p>
+<h1 align="center">Share files with Security written in Go</h1>
+
+## About
+
+`p2pshare` P2P File Share with Security
 
 ```bash
 # Receive mode (listener)
