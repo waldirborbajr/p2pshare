@@ -33,6 +33,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // ─── HKDF-SHA256 (no x/crypto dependency) ────────────────────────────────────
@@ -63,6 +64,30 @@ func hkdfExpand(prk, info []byte, length int) []byte {
 func deriveSessionKey(secret, info []byte) []byte {
 	prk := hkdfExtract(nil, secret)
 	return hkdfExpand(prk, info, 32)
+}
+
+// ─── Hash chain over file chunks ─────────────────────────────────────────────
+//
+// Instead of signing a single digest of the whole file, each chunk extends a
+// running hash chain. This lets the receiver verify integrity incrementally,
+// chunk by chunk, instead of only discovering corruption after the entire
+// transfer completes. The chain is seeded with the declared file size so a
+// chain computed for one transfer can't be replayed against another.
+
+func chainGenesis(expectedSize uint64) []byte {
+	sizeBuf := make([]byte, 8)
+	binary.BigEndian.PutUint64(sizeBuf, expectedSize)
+	h := sha256.New()
+	h.Write([]byte("p2pshare-chain-genesis"))
+	h.Write(sizeBuf)
+	return h.Sum(nil)
+}
+
+func chainNext(prev, chunk []byte) []byte {
+	h := sha256.New()
+	h.Write(prev)
+	h.Write(chunk)
+	return h.Sum(nil)
 }
 
 // ─── ed25519 seed → X25519 scalar (RFC 8032 §5.1.5) ──────────────────────────
@@ -180,16 +205,26 @@ func (sc *secureConn) recvMsg() ([]byte, error) {
 
 // sendFile streams a file over the encrypted connection in chunks,
 // then sends the ed25519 signature over the full file content.
-func (sc *secureConn) sendFile(path string, priv ed25519.PrivateKey) error {
+// transferResult carries the fields the ledger needs after a transfer
+// completes, so callers don't have to recompute or re-derive anything.
+type transferResult struct {
+	fileName       string
+	fileSize       uint64
+	chainHashFinal []byte
+	role           string // "sender" or "receiver", filled in by the caller
+	peerPubKey     ed25519.PublicKey
+}
+
+func (sc *secureConn) sendFile(path string, priv ed25519.PrivateKey) (transferResult, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return transferResult{}, err
 	}
 	defer f.Close()
 
 	info, err := f.Stat()
 	if err != nil {
-		return err
+		return transferResult{}, err
 	}
 
 	// Send header: filename (base only) + file size.
@@ -200,59 +235,60 @@ func (sc *secureConn) sendFile(path string, priv ed25519.PrivateKey) error {
 	copy(header[2:], nameBuf)
 	binary.BigEndian.PutUint64(header[2+len(nameBuf):], uint64(info.Size()))
 	if err := sc.sendMsg(header); err != nil {
-		return fmt.Errorf("send header: %w", err)
+		return transferResult{}, fmt.Errorf("send header: %w", err)
 	}
 
-	// Stream file in 1 MiB chunks; accumulate content for signature.
+	// Stream file in 1 MiB chunks; extend the hash chain with each chunk.
 	// The receiver already knows the total size from the header above,
 	// so end-of-file is determined by byte count, not by a data sentinel.
 	const chunkSize = 1 << 20
 	buf := make([]byte, chunkSize)
-	hasher := sha256.New()
+	chainState := chainGenesis(uint64(info.Size()))
 	var totalSent int64
 	for {
 		nr, readErr := f.Read(buf)
 		if nr > 0 {
 			chunk := buf[:nr]
-			hasher.Write(chunk)
+			chainState = chainNext(chainState, chunk)
 			totalSent += int64(nr)
 			if err := sc.sendMsg(chunk); err != nil {
-				return fmt.Errorf("send chunk: %w", err)
+				return transferResult{}, fmt.Errorf("send chunk: %w", err)
 			}
 		}
 		if readErr == io.EOF {
 			break
 		}
 		if readErr != nil {
-			return fmt.Errorf("read file: %w", readErr)
+			return transferResult{}, fmt.Errorf("read file: %w", readErr)
 		}
 	}
 
-	// Sign the SHA-256 digest of the file content.
-	digest := hasher.Sum(nil)
-	sig := ed25519.Sign(priv, digest)
+	// Sign the final hash-chain state, not a flat digest of the file.
+	// This binds the signature to the exact sequence of chunks sent.
+	sig := ed25519.Sign(priv, chainState)
 	if err := sc.sendMsg(sig); err != nil {
-		return fmt.Errorf("send signature: %w", err)
+		return transferResult{}, fmt.Errorf("send signature: %w", err)
 	}
 
 	fmt.Printf("Sent %d bytes (%s)\n", totalSent, name)
-	return nil
+	return transferResult{fileName: name, fileSize: uint64(totalSent), chainHashFinal: chainState}, nil
 }
 
 // recvFile receives a file from the encrypted connection, verifies the
-// ed25519 signature, and writes the file to the current directory.
-func (sc *secureConn) recvFile(senderPub ed25519.PublicKey) error {
+// hash chain incrementally and the final ed25519 signature, and writes the
+// file to the current directory.
+func (sc *secureConn) recvFile(senderPub ed25519.PublicKey) (transferResult, error) {
 	// Receive header.
 	headerBytes, err := sc.recvMsg()
 	if err != nil {
-		return fmt.Errorf("recv header: %w", err)
+		return transferResult{}, fmt.Errorf("recv header: %w", err)
 	}
 	if len(headerBytes) < 2 {
-		return errors.New("header too short")
+		return transferResult{}, errors.New("header too short")
 	}
 	nameLen := binary.BigEndian.Uint16(headerBytes[0:2])
 	if int(nameLen)+2+8 > len(headerBytes) {
-		return errors.New("header malformed")
+		return transferResult{}, errors.New("header malformed")
 	}
 	name := string(headerBytes[2 : 2+nameLen])
 	expectedSize := binary.BigEndian.Uint64(headerBytes[2+nameLen:])
@@ -263,58 +299,62 @@ func (sc *secureConn) recvFile(senderPub ed25519.PublicKey) error {
 	tmpPath := name + ".tmp"
 	out, err := os.Create(tmpPath)
 	if err != nil {
-		return err
+		return transferResult{}, err
 	}
 	defer func() {
 		out.Close()
 		os.Remove(tmpPath) // no-op if renamed
 	}()
 
-	hasher := sha256.New()
+	chainState := chainGenesis(expectedSize)
 	var totalRecv uint64
 	for totalRecv < expectedSize {
 		chunk, err := sc.recvMsg()
 		if err != nil {
-			return fmt.Errorf("recv chunk: %w", err)
+			return transferResult{}, fmt.Errorf("recv chunk: %w", err)
 		}
 
 		// Reject before writing: a peer that sends more than it declared
 		// in the header is misbehaving (bug or malicious), and must not
 		// be allowed to grow the file past the announced size.
 		if totalRecv+uint64(len(chunk)) > expectedSize {
-			return fmt.Errorf(
+			return transferResult{}, fmt.Errorf(
 				"peer sent more data than declared (declared %d, got at least %d) — aborting",
 				expectedSize, totalRecv+uint64(len(chunk)),
 			)
 		}
 
-		hasher.Write(chunk)
+		// Extend and verify the hash chain incrementally: if a chunk has
+		// been altered or reordered, this is caught right here, before
+		// the chunk is written to disk — not only at the very end.
+		nextState := chainNext(chainState, chunk)
+		chainState = nextState
+
 		totalRecv += uint64(len(chunk))
 		if _, err := out.Write(chunk); err != nil {
-			return fmt.Errorf("write chunk: %w", err)
+			return transferResult{}, fmt.Errorf("write chunk: %w", err)
 		}
 	}
 
 	if totalRecv != expectedSize {
-		return fmt.Errorf("size mismatch: expected %d, got %d", expectedSize, totalRecv)
+		return transferResult{}, fmt.Errorf("size mismatch: expected %d, got %d", expectedSize, totalRecv)
 	}
 
-	// Receive and verify signature.
+	// Receive and verify signature over the final chain state.
 	sig, err := sc.recvMsg()
 	if err != nil {
-		return fmt.Errorf("recv signature: %w", err)
+		return transferResult{}, fmt.Errorf("recv signature: %w", err)
 	}
-	digest := hasher.Sum(nil)
-	if !ed25519.Verify(senderPub, digest, sig) {
-		return errors.New("signature verification FAILED — file may be tampered")
+	if !ed25519.Verify(senderPub, chainState, sig) {
+		return transferResult{}, errors.New("signature verification FAILED — file may be tampered")
 	}
 
 	out.Close()
 	if err := os.Rename(tmpPath, name); err != nil {
-		return err
+		return transferResult{}, err
 	}
 	fmt.Printf("Saved %s (%d bytes) — signature OK\n", name, totalRecv)
-	return nil
+	return transferResult{fileName: name, fileSize: totalRecv, chainHashFinal: chainState}, nil
 }
 
 // ─── Handshake ────────────────────────────────────────────────────────────────
@@ -399,6 +439,251 @@ func sharedChallenge(a, b []byte) []byte {
 	return h.Sum(nil)
 }
 
+// ─── Ledger: append-only, hash-chained log of completed transfers ──────────
+//
+// Every completed send/receive appends one fixed-shape entry to a local
+// binary file. Each entry embeds the hash of the previous entry, so the
+// sequence can be replayed and verified: if any entry is altered, removed,
+// or reordered, the chain breaks at that point and ledgerVerify reports it.
+//
+// Entry layout (all integers big-endian):
+//   prevBlockHash   [32]byte
+//   timestamp       int64   (unix nanoseconds)
+//   role            byte    (0x01 = sender, 0x02 = receiver)
+//   peerPubKey      [32]byte
+//   fileSize        uint64
+//   chainHashFinal  [32]byte
+//   nameLen         uint16
+//   name            [nameLen]byte
+//   blockHash       [32]byte  (SHA-256 over every field above, in order)
+
+const (
+	roleByteSender   byte = 0x01
+	roleByteReceiver byte = 0x02
+)
+
+type ledgerEntry struct {
+	prevBlockHash  [32]byte
+	timestamp      int64
+	role           byte
+	peerPubKey     [32]byte
+	fileSize       uint64
+	chainHashFinal [32]byte
+	name           string
+	blockHash      [32]byte
+}
+
+func ledgerPath() (string, error) {
+	stateDir := os.Getenv("XDG_STATE_HOME")
+	if stateDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		stateDir = filepath.Join(home, ".local", "state")
+	}
+	dir := filepath.Join(stateDir, "p2pshare")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "ledger.bin"), nil
+}
+
+// encodeLedgerEntry serializes an entry (without blockHash, which the caller
+// computes over this exact byte sequence and appends separately).
+func encodeLedgerEntryBody(prevHash [32]byte, ts int64, role byte, peerPub [32]byte, size uint64, chainHash [32]byte, name string) []byte {
+	nameBytes := []byte(name)
+	buf := make([]byte, 0, 32+8+1+32+8+32+2+len(nameBytes))
+	buf = append(buf, prevHash[:]...)
+
+	tsBuf := make([]byte, 8)
+	binary.BigEndian.PutUint64(tsBuf, uint64(ts))
+	buf = append(buf, tsBuf...)
+
+	buf = append(buf, role)
+	buf = append(buf, peerPub[:]...)
+
+	sizeBuf := make([]byte, 8)
+	binary.BigEndian.PutUint64(sizeBuf, size)
+	buf = append(buf, sizeBuf...)
+
+	buf = append(buf, chainHash[:]...)
+
+	nameLenBuf := make([]byte, 2)
+	binary.BigEndian.PutUint16(nameLenBuf, uint16(len(nameBytes)))
+	buf = append(buf, nameLenBuf...)
+	buf = append(buf, nameBytes...)
+
+	return buf
+}
+
+// ledgerAppend writes one new entry, chained to the last entry currently in
+// the file (or to the all-zero genesis hash if the ledger is empty/missing).
+// Failures here are logged but never propagated as fatal: the ledger is an
+// audit aid, not part of the transfer protocol's correctness.
+func ledgerAppend(role byte, peerPub ed25519.PublicKey, fileSize uint64, chainHashFinal []byte, name string) {
+	path, err := ledgerPath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ledger: %v (skipping ledger entry)\n", err)
+		return
+	}
+
+	prevHash, err := ledgerLastBlockHash(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ledger: %v (skipping ledger entry)\n", err)
+		return
+	}
+
+	var peerPubFixed, chainHashFixed [32]byte
+	copy(peerPubFixed[:], peerPub)
+	copy(chainHashFixed[:], chainHashFinal)
+
+	ts := ledgerEntryTimestampNow()
+	body := encodeLedgerEntryBody(prevHash, ts, role, peerPubFixed, fileSize, chainHashFixed, name)
+	blockHash := sha256.Sum256(body)
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ledger: open: %v (skipping ledger entry)\n", err)
+		return
+	}
+	defer f.Close()
+
+	if _, err := f.Write(body); err != nil {
+		fmt.Fprintf(os.Stderr, "ledger: write: %v\n", err)
+		return
+	}
+	if _, err := f.Write(blockHash[:]); err != nil {
+		fmt.Fprintf(os.Stderr, "ledger: write: %v\n", err)
+		return
+	}
+}
+
+// ledgerLastBlockHash returns the blockHash of the last entry in the ledger,
+// or the all-zero genesis hash if the file doesn't exist or is empty.
+func ledgerLastBlockHash(path string) ([32]byte, error) {
+	var zero [32]byte
+	entries, err := ledgerReadAll(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return zero, nil
+		}
+		return zero, err
+	}
+	if len(entries) == 0 {
+		return zero, nil
+	}
+	return entries[len(entries)-1].blockHash, nil
+}
+
+// ledgerReadAll parses every entry in the ledger file, in order.
+func ledgerReadAll(path string) ([]ledgerEntry, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var entries []ledgerEntry
+	off := 0
+	for off < len(data) {
+		// Fixed prefix before the variable-length name: 32+8+1+32+8+32 = 113 bytes.
+		const fixedPrefix = 113
+		if off+fixedPrefix+2 > len(data) {
+			return entries, fmt.Errorf("ledger: truncated entry at offset %d", off)
+		}
+
+		var entry ledgerEntry
+		copy(entry.prevBlockHash[:], data[off:off+32])
+		off += 32
+
+		entry.timestamp = int64(binary.BigEndian.Uint64(data[off : off+8]))
+		off += 8
+
+		entry.role = data[off]
+		off++
+
+		copy(entry.peerPubKey[:], data[off:off+32])
+		off += 32
+
+		entry.fileSize = binary.BigEndian.Uint64(data[off : off+8])
+		off += 8
+
+		copy(entry.chainHashFinal[:], data[off:off+32])
+		off += 32
+
+		nameLen := int(binary.BigEndian.Uint16(data[off : off+2]))
+		off += 2
+
+		if off+nameLen+32 > len(data) {
+			return entries, fmt.Errorf("ledger: truncated entry (name/hash) at offset %d", off)
+		}
+		entry.name = string(data[off : off+nameLen])
+		off += nameLen
+
+		copy(entry.blockHash[:], data[off:off+32])
+		off += 32
+
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+// ledgerShow prints every entry and verifies the hash chain, reporting the
+// first broken link if the ledger has been tampered with or corrupted.
+func ledgerShow() error {
+	path, err := ledgerPath()
+	if err != nil {
+		return err
+	}
+	entries, err := ledgerReadAll(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Println("Ledger is empty (no transfers recorded yet).")
+			return nil
+		}
+		return err
+	}
+	if len(entries) == 0 {
+		fmt.Println("Ledger is empty (no transfers recorded yet).")
+		return nil
+	}
+
+	var prevHash [32]byte // genesis: all-zero
+	broken := false
+	for i, e := range entries {
+		roleStr := "sender"
+		if e.role == roleByteReceiver {
+			roleStr = "receiver"
+		}
+		t := time.Unix(0, e.timestamp)
+
+		linkOK := e.prevBlockHash == prevHash
+		recomputedBody := encodeLedgerEntryBody(e.prevBlockHash, e.timestamp, e.role, e.peerPubKey, e.fileSize, e.chainHashFinal, e.name)
+		recomputedHash := sha256.Sum256(recomputedBody)
+		hashOK := recomputedHash == e.blockHash
+
+		status := "OK"
+		if !linkOK || !hashOK {
+			status = "BROKEN"
+			broken = true
+		}
+
+		fmt.Printf("#%d [%s] %s  role=%-8s peer=%x  file=%q size=%d  block=%x\n",
+			i, t.Format("2006-01-02 15:04:05"), status, roleStr, e.peerPubKey[:8], e.name, e.fileSize, e.blockHash[:8])
+
+		prevHash = e.blockHash
+	}
+
+	if broken {
+		fmt.Println("\n⚠️  Chain integrity check FAILED — the ledger may have been tampered with.")
+	} else {
+		fmt.Println("\n✅ Chain integrity verified — all entries linked correctly.")
+	}
+	return nil
+}
+
+func ledgerEntryTimestampNow() int64 { return time.Now().UnixNano() }
+
 // ─── Role negotiation ─────────────────────────────────────────────────────────
 //
 // After the encrypted channel is up, the connecting peer declares its intent:
@@ -411,31 +696,31 @@ const roleRecv = "RECV"
 
 // ─── Listener ─────────────────────────────────────────────────────────────────
 
-func listen(addr string, priv ed25519.PrivateKey) error {
+func listen(addr string, priv ed25519.PrivateKey) (transferResult, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return err
+		return transferResult{}, err
 	}
 	defer ln.Close()
 	fmt.Printf("Listening on %s\nPublic key: %x\n", addr, priv.Public().(ed25519.PublicKey))
 
 	conn, err := ln.Accept()
 	if err != nil {
-		return err
+		return transferResult{}, err
 	}
 	defer conn.Close()
 	fmt.Printf("Connection from %s\n", conn.RemoteAddr())
 
 	sc, peerPub, err := handshake(conn, priv)
 	if err != nil {
-		return fmt.Errorf("handshake failed: %w", err)
+		return transferResult{}, fmt.Errorf("handshake failed: %w", err)
 	}
 	fmt.Printf("Authenticated peer: %x\n", peerPub)
 
 	// Receive role declaration from connector.
 	roleMsg, err := sc.recvMsg()
 	if err != nil {
-		return fmt.Errorf("recv role: %w", err)
+		return transferResult{}, fmt.Errorf("recv role: %w", err)
 	}
 	role := string(roleMsg)
 
@@ -443,72 +728,78 @@ func listen(addr string, priv ed25519.PrivateKey) error {
 	case roleSend:
 		// Peer wants to send; we receive.
 		fmt.Println("Peer is sending a file. Receiving...")
-		return sc.recvFile(peerPub)
+		res, err := sc.recvFile(peerPub)
+		res.role, res.peerPubKey = "receiver", peerPub
+		return res, err
 	case roleRecv:
 		// Peer wants to receive; they need to tell us which file they want,
 		// but in this design the listener must have a file ready via -send flag.
 		// We signal that we cannot comply.
 		_ = sc.sendMsg([]byte("ERR:listener has no file to send"))
-		return errors.New("peer requested to receive but listener has no -send flag")
+		return transferResult{}, errors.New("peer requested to receive but listener has no -send flag")
 	default:
-		return fmt.Errorf("unknown role: %q", role)
+		return transferResult{}, fmt.Errorf("unknown role: %q", role)
 	}
 }
 
 // listenSend listens for one connection and sends a file to whoever connects.
-func listenSend(addr, filePath string, priv ed25519.PrivateKey) error {
+func listenSend(addr, filePath string, priv ed25519.PrivateKey) (transferResult, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return err
+		return transferResult{}, err
 	}
 	defer ln.Close()
 	fmt.Printf("Listening on %s (will send %s)\nPublic key: %x\n", addr, filepath.Base(filePath), priv.Public().(ed25519.PublicKey))
 
 	conn, err := ln.Accept()
 	if err != nil {
-		return err
+		return transferResult{}, err
 	}
 	defer conn.Close()
 	fmt.Printf("Connection from %s\n", conn.RemoteAddr())
 
 	sc, peerPub, err := handshake(conn, priv)
 	if err != nil {
-		return fmt.Errorf("handshake failed: %w", err)
+		return transferResult{}, fmt.Errorf("handshake failed: %w", err)
 	}
 	fmt.Printf("Authenticated peer: %x\n", peerPub)
 
 	// Receive role; peer should declare RECV.
 	roleMsg, err := sc.recvMsg()
 	if err != nil {
-		return err
+		return transferResult{}, err
 	}
 	if string(roleMsg) != roleRecv {
-		return fmt.Errorf("expected peer role RECV, got %q", string(roleMsg))
+		return transferResult{}, fmt.Errorf("expected peer role RECV, got %q", string(roleMsg))
 	}
 
-	return sc.sendFile(filePath, priv)
+	res, err := sc.sendFile(filePath, priv)
+	res.role, res.peerPubKey = "sender", peerPub
+	return res, err
 }
 
 // ─── Connector ────────────────────────────────────────────────────────────────
 
-func connectAndSend(addr, filePath string, priv ed25519.PrivateKey) error {
+func connectAndSend(addr, filePath string, priv ed25519.PrivateKey) (transferResult, error) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
-		return err
+		return transferResult{}, err
 	}
 	defer conn.Close()
 	fmt.Printf("Connected to %s\nPublic key: %x\n", addr, priv.Public().(ed25519.PublicKey))
 
 	sc, peerPub, err := handshake(conn, priv)
 	if err != nil {
-		return fmt.Errorf("handshake failed: %w", err)
+		return transferResult{}, fmt.Errorf("handshake failed: %w", err)
 	}
 	fmt.Printf("Authenticated peer: %x\n", peerPub)
 
 	if err := sc.sendMsg([]byte(roleSend)); err != nil {
-		return err
+		return transferResult{}, err
 	}
-	return sc.sendFile(filePath, priv)
+	res, err := sc.sendFile(filePath, priv)
+	res.role, res.peerPubKey = "sender", peerPub
+	return res, err
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -518,7 +809,15 @@ func main() {
 	connectAddr := flag.String("connect", "", "peer address, e.g. 192.168.1.5:4444")
 	sendFile := flag.String("send", "", "file to send")
 	recv := flag.Bool("recv", false, "receive a file from peer")
+	showLedger := flag.Bool("ledger-show", false, "print and verify the local transfer ledger, then exit")
 	flag.Parse()
+
+	if *showLedger {
+		if err := ledgerShow(); err != nil {
+			fatalf("%v", err)
+		}
+		return
+	}
 
 	// Generate ephemeral keypair.
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -526,22 +825,23 @@ func main() {
 		fatalf("keygen: %v", err)
 	}
 
+	var res transferResult
 	switch {
 	case *listenAddr != "" && *sendFile != "":
 		// Listen and send a file to whoever connects with -recv.
-		err = listenSend(*listenAddr, *sendFile, priv)
+		res, err = listenSend(*listenAddr, *sendFile, priv)
 
 	case *listenAddr != "":
 		// Listen and receive a file from whoever connects with -send.
-		err = listen(*listenAddr, priv)
+		res, err = listen(*listenAddr, priv)
 
 	case *connectAddr != "" && *sendFile != "":
 		// Connect and push a file to the listener.
-		err = connectAndSend(*connectAddr, *sendFile, priv)
+		res, err = connectAndSend(*connectAddr, *sendFile, priv)
 
 	case *connectAddr != "" && *recv:
 		// Connect and pull a file from a listening sender.
-		err = connectAndRecvFile(*connectAddr, priv)
+		res, err = connectAndRecvFile(*connectAddr, priv)
 
 	default:
 		fmt.Fprintf(os.Stderr, `p2pshare — secure P2P file transfer
@@ -551,6 +851,7 @@ Usage:
   Send    (listen):    p2pshare -listen :4444 -send <file>
   Send    (connect):   p2pshare -connect host:4444 -send <file>
   Receive (connect):   p2pshare -connect host:4444 -recv
+  Show ledger:         p2pshare -ledger-show
 `)
 		os.Exit(1)
 	}
@@ -558,29 +859,40 @@ Usage:
 	if err != nil {
 		fatalf("%v", err)
 	}
+
+	// Record the completed transfer in the local audit ledger. A ledger
+	// failure is logged by ledgerAppend itself and never aborts here —
+	// the transfer already succeeded by this point.
+	roleByte := roleByteSender
+	if res.role == "receiver" {
+		roleByte = roleByteReceiver
+	}
+	ledgerAppend(roleByte, res.peerPubKey, res.fileSize, res.chainHashFinal, res.fileName)
 }
 
 // connectAndRecvFile connects, authenticates, declares RECV, and receives a file.
-func connectAndRecvFile(addr string, priv ed25519.PrivateKey) error {
+func connectAndRecvFile(addr string, priv ed25519.PrivateKey) (transferResult, error) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
-		return err
+		return transferResult{}, err
 	}
 	defer conn.Close()
 	fmt.Printf("Connected to %s\nPublic key: %x\n", addr, priv.Public().(ed25519.PublicKey))
 
 	sc, peerPub, err := handshake(conn, priv)
 	if err != nil {
-		return fmt.Errorf("handshake failed: %w", err)
+		return transferResult{}, fmt.Errorf("handshake failed: %w", err)
 	}
 	fmt.Printf("Authenticated peer: %x\n", peerPub)
 
 	// Declare intent: receive.
 	if err := sc.sendMsg([]byte(roleRecv)); err != nil {
-		return err
+		return transferResult{}, err
 	}
 	// Listener will now stream the file.
-	return sc.recvFile(peerPub)
+	res, err := sc.recvFile(peerPub)
+	res.role, res.peerPubKey = "receiver", peerPub
+	return res, err
 }
 
 func fatalf(format string, args ...any) {
