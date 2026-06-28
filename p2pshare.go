@@ -204,6 +204,8 @@ func (sc *secureConn) sendFile(path string, priv ed25519.PrivateKey) error {
 	}
 
 	// Stream file in 1 MiB chunks; accumulate content for signature.
+	// The receiver already knows the total size from the header above,
+	// so end-of-file is determined by byte count, not by a data sentinel.
 	const chunkSize = 1 << 20
 	buf := make([]byte, chunkSize)
 	hasher := sha256.New()
@@ -224,11 +226,6 @@ func (sc *secureConn) sendFile(path string, priv ed25519.PrivateKey) error {
 		if readErr != nil {
 			return fmt.Errorf("read file: %w", readErr)
 		}
-	}
-
-	// Signal end of file.
-	if err := sc.sendMsg([]byte("EOF")); err != nil {
-		return fmt.Errorf("send EOF marker: %w", err)
 	}
 
 	// Sign the SHA-256 digest of the file content.
@@ -274,23 +271,31 @@ func (sc *secureConn) recvFile(senderPub ed25519.PublicKey) error {
 	}()
 
 	hasher := sha256.New()
-	var totalRecv int64
-	for {
+	var totalRecv uint64
+	for totalRecv < expectedSize {
 		chunk, err := sc.recvMsg()
 		if err != nil {
 			return fmt.Errorf("recv chunk: %w", err)
 		}
-		if string(chunk) == "EOF" {
-			break
+
+		// Reject before writing: a peer that sends more than it declared
+		// in the header is misbehaving (bug or malicious), and must not
+		// be allowed to grow the file past the announced size.
+		if totalRecv+uint64(len(chunk)) > expectedSize {
+			return fmt.Errorf(
+				"peer sent more data than declared (declared %d, got at least %d) — aborting",
+				expectedSize, totalRecv+uint64(len(chunk)),
+			)
 		}
+
 		hasher.Write(chunk)
-		totalRecv += int64(len(chunk))
+		totalRecv += uint64(len(chunk))
 		if _, err := out.Write(chunk); err != nil {
 			return fmt.Errorf("write chunk: %w", err)
 		}
 	}
 
-	if uint64(totalRecv) != expectedSize {
+	if totalRecv != expectedSize {
 		return fmt.Errorf("size mismatch: expected %d, got %d", expectedSize, totalRecv)
 	}
 
