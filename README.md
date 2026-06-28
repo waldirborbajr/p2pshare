@@ -19,7 +19,7 @@ Three independent layers protect every transfer.
 
 **Encrypted channel** — the ed25519 seed is converted to an X25519 scalar (SHA-512 + RFC 8032 clamping), both sides run X25519 ECDH, and the resulting shared secret is fed through HKDF-SHA256 to produce a 32-byte AES-256-GCM session key. Every message frame gets a fresh random 12-byte nonce.
 
-**File integrity** — the sender signs `SHA-256(file)` with its ed25519 key after streaming all chunks. The receiver verifies the signature before calling `rename()`. A failed verification deletes the temp file and exits non-zero.
+**File integrity** — each chunk extends a running hash chain seeded with the declared file size (`chainHash₀ = SHA-256("p2pshare-chain-genesis" || size)`, `chainHashᵢ = SHA-256(chainHashᵢ₋₁ || chunkᵢ)`). The sender signs the final chain hash with its ed25519 key once all chunks are sent. The receiver recomputes the chain as each chunk arrives, so a tampered or reordered chunk is caught immediately — not only after the whole file has been received. The final signature is verified before calling `rename()`; a failed verification deletes the temp file and exits non-zero.
 
 ### Wire protocol (per connection)
 
@@ -33,10 +33,17 @@ Three independent layers protect every transfer.
 [AES-256-GCM frames from here — each: 4-byte length | 12-byte nonce | ciphertext+tag]
   → "SEND" or "RECV"   role declaration
   → header             [2-byte name len | filename | 8-byte file size]
-  → chunk …            1 MiB chunks
-  → "EOF"
-  → 64 bytes           ed25519 sig over SHA-256(file)
+  → chunk …            1 MiB chunks, until declared file size is reached
+  → 64 bytes           ed25519 sig over the final hash-chain state
 ```
+
+End-of-file is determined by byte count against the size declared in the
+header — there is no longer a separate "EOF" marker. This closes two issues
+with the old sentinel-based framing: a chunk that happened to contain the
+literal bytes `EOF` could trigger a false end-of-file, and a peer could
+keep streaming past its declared size with nothing to stop it before disk
+filled up. The receiver now rejects any chunk that would push the total
+past the declared size, before writing it.
 
 ---
 
@@ -59,14 +66,14 @@ Or run directly without building:
 
 ```sh
 # Receive mode (listener)
-go run p2pshare.go -listen :4444
+go run main.go -listen :4444
 
 # Send mode (connector pushes file)
-go run p2pshare.go -connect host:4444 -send ./myfile.zip
+go run main.go -connect host:4444 -send ./myfile.zip
 
 # Listener pushes, connector pulls
-go run p2pshare.go -listen :4444 -send ./myfile.zip
-go run p2pshare.go -connect host:4444 -recv
+go run main.go -listen :4444 -send ./myfile.zip
+go run main.go -connect host:4444 -recv
 ```
 
 ---
@@ -105,6 +112,7 @@ p2pshare -connect 192.168.1.10:4444 -recv
 | `-connect <addr>` | connect to a listening peer, e.g. `192.168.1.10:4444` |
 | `-send <file>` | file to send (combine with `-listen` or `-connect`) |
 | `-recv` | receive a file (combine with `-connect`) |
+| `-ledger-show` | print and verify the local transfer ledger, then exit |
 
 ---
 
@@ -125,6 +133,34 @@ Authenticated peer: 9f4d67a852e6081e...
 Receiving: report.pdf (2048312 bytes)
 Saved report.pdf (2048312 bytes) — signature OK
 ```
+
+---
+
+## Audit ledger
+
+Every completed transfer — sent or received — is appended to a local,
+hash-chained ledger. Each entry stores the previous entry's hash, so the
+sequence can be verified end to end: corrupting, removing, or reordering
+any entry breaks the chain at that point, and `-ledger-show` reports
+exactly where.
+
+```sh
+p2pshare -ledger-show
+```
+
+```
+#0 [2026-06-28 00:21:13] OK  role=sender   peer=c13c0c18bf4caf8b  file="report.pdf" size=2048312  block=50bc39190983ac63
+#1 [2026-06-28 00:21:30] OK  role=receiver peer=8f202fd90e47a239  file="notes.txt"  size=58       block=58fe25e59fda3872
+
+✅ Chain integrity verified — all entries linked correctly.
+```
+
+The ledger lives at `$XDG_STATE_HOME/p2pshare/ledger.bin` (defaulting to
+`~/.local/state/p2pshare/ledger.bin`) and records, per entry: timestamp,
+role, the remote peer's public key, filename, size, and the transfer's
+final hash-chain value. It's an audit trail, not part of the transfer
+protocol — a failed write to the ledger is logged to stderr and never
+aborts an otherwise-successful transfer.
 
 ---
 
@@ -153,4 +189,3 @@ Saved report.pdf (2048312 bytes) — signature OK
 ## License
 
 MIT
-
