@@ -3,189 +3,312 @@
 </p>
 <h1 align="center">Share files with Security written in Go</h1>
 
-# p2pshare
+# p2pshare - P2P File Share with Security
 
-> secure · ephemeral · direct
+> secure · ephemeral · direct · encrypted
 
 P2P file transfer over a direct TCP connection. No broker, no relay, no stored keys. Every run generates a fresh ed25519 keypair; when the process exits, the keys are gone.
 
 ---
 
-## Security model
+## ✨ Features
+
+- 🔐 **Mutual authentication** — ed25519 signatures with challenge-response
+- 🔒 **Encrypted channel** — X25519 ECDH + AES-256-GCM (hardware accelerated)
+- 📦 **File integrity** — SHA-256 hash chain verification
+- 📁 **Directory support** — Send entire directories (compressed as .tar.gz)
+- 📊 **Progress bar** — Visual feedback during transfers
+- ⏱️ **Configurable timeouts** — Handshake, read, write, idle
+- 🔑 **PSK support** — Optional Pre-Shared Key for extra security
+- 📝 **Structured logging** — JSON or human-readable format
+- 🗜️ **Compression** — Optional gzip compression
+- 📋 **Audit ledger** — Hash-chained transfer history
+
+---
+
+## 🔒 Security Model
 
 Three independent layers protect every transfer.
 
-**Mutual authentication** — both peers exchange ed25519 public keys and each signs a shared challenge derived from both keys. The challenge is key-bound, so replaying a captured handshake with a different key fails immediately.
-
-**Encrypted channel** — the ed25519 seed is converted to an X25519 scalar (SHA-512 + RFC 8032 clamping), both sides run X25519 ECDH, and the resulting shared secret is fed through HKDF-SHA256 to produce a 32-byte AES-256-GCM session key. Every message frame gets a fresh random 12-byte nonce.
-
-**File integrity** — each chunk extends a running hash chain seeded with the declared file size (`chainHash₀ = SHA-256("p2pshare-chain-genesis" || size)`, `chainHashᵢ = SHA-256(chainHashᵢ₋₁ || chunkᵢ)`). The sender signs the final chain hash with its ed25519 key once all chunks are sent. The receiver recomputes the chain as each chunk arrives, so a tampered or reordered chunk is caught immediately — not only after the whole file has been received. The final signature is verified before calling `rename()`; a failed verification deletes the temp file and exits non-zero.
-
-### Wire protocol (per connection)
-
-```
-[raw TCP — pre-encryption]
-  → 32 bytes  ed25519 public key
-  ← 32 bytes  ed25519 public key
-  → 64 bytes  ed25519 sig over sharedChallenge(myPub, peerPub)
-  ← 64 bytes  ed25519 sig
-
-[AES-256-GCM frames from here — each: 4-byte length | 12-byte nonce | ciphertext+tag]
-  → "SEND" or "RECV"   role declaration
-  → header             [2-byte name len | filename | 8-byte file size]
-  → chunk …            1 MiB chunks, until declared file size is reached
-  → 64 bytes           ed25519 sig over the final hash-chain state
-```
-
-End-of-file is determined by byte count against the size declared in the
-header — there is no longer a separate "EOF" marker. This closes two issues
-with the old sentinel-based framing: a chunk that happened to contain the
-literal bytes `EOF` could trigger a false end-of-file, and a peer could
-keep streaming past its declared size with nothing to stop it before disk
-filled up. The receiver now rejects any chunk that would push the total
-past the declared size, before writing it.
+1. **Mutual authentication** — both peers exchange ed25519 public keys and sign a shared challenge
+2. **Encrypted channel** — X25519 ECDH + HKDF-SHA256 + AES-256-GCM
+3. **File integrity** — SHA-256 hash chain with final signature
 
 ---
 
-## Requirements
+## 📦 Installation
 
-- Go 1.22 or later
-- No external dependencies — stdlib only (`crypto/ed25519`, `crypto/ecdh`, `crypto/aes`, `math/big`, …)
-
----
-
-## Installation
-
-```sh
+```bash
 git clone https://github.com/waldirborbajr/p2pshare
 cd p2pshare
 go build -o p2pshare .
 ```
 
-Or run directly without building:
+---
 
-```sh
-# Receive mode (listener)
-go run main.go -listen :4444
+## 🚀 Quick Start
 
-# Send mode (connector pushes file)
-go run main.go -connect host:4444 -send ./myfile.zip
+### Receiver listens
+```bash
+./p2pshare -listen :4444 -recv
+```
 
-# Listener pushes, connector pulls
-go run main.go -listen :4444 -send ./myfile.zip
-go run main.go -connect host:4444 -recv
+### Sender connects and sends file
+```bash
+./p2pshare -connect 192.168.1.10:4444 -send ./file.txt
 ```
 
 ---
 
-## Usage
+## 🚀 Exemplos Práticos
 
-There are four modes. Pick the combination that matches who is behind NAT.
+### 1. Transferência Básica de Arquivo
 
-### Connector pushes a file to a listening receiver
-
-```sh
-# receiver — listens and waits
-p2pshare -listen :4444
-
-# sender — connects and pushes
-p2pshare -connect 192.168.1.10:4444 -send ./archive.tar.gz
+**Receptor (escuta):**
+```bash
+./p2pshare -listen :4444 -recv
 ```
 
-### Listener offers a file; connector pulls it
-
-Useful when the sender is behind NAT and the receiver has a public address.
-
-```sh
-# sender — listens with a file ready
-p2pshare -listen :4444 -send ./archive.tar.gz
-
-# receiver — connects and pulls
-p2pshare -connect 192.168.1.10:4444 -recv
-```
-
-### Flag reference
-
-| flag | description |
-|---|---|
-| `-listen <addr>` | bind and accept one connection, e.g. `:4444` |
-| `-connect <addr>` | connect to a listening peer, e.g. `192.168.1.10:4444` |
-| `-send <file>` | file to send (combine with `-listen` or `-connect`) |
-| `-recv` | receive a file (combine with `-connect`) |
-| `-ledger-show` | print and verify the local transfer ledger, then exit |
-
----
-
-## Example session output
-
-```
-# Sender side
-Listening on :4444 (will send report.pdf)
-Public key: 9f4d67a852e6081e...
-Connection from 10.0.0.5:51234
-Authenticated peer: 47601b73840d80ca...
-Sent 2048312 bytes (report.pdf)
-
-# Receiver side
-Connected to 10.0.0.3:4444
-Public key: 47601b73840d80ca...
-Authenticated peer: 9f4d67a852e6081e...
-Receiving: report.pdf (2048312 bytes)
-Saved report.pdf (2048312 bytes) — signature OK
+**Remetente (conecta e envia):**
+```bash
+./p2pshare -connect 192.168.1.10:4444 -send ./documento.pdf
 ```
 
 ---
 
-## Audit ledger
+### 2. Enviar um Diretório Inteiro
 
-Every completed transfer — sent or received — is appended to a local,
-hash-chained ledger. Each entry stores the previous entry's hash, so the
-sequence can be verified end to end: corrupting, removing, or reordering
-any entry breaks the chain at that point, and `-ledger-show` reports
-exactly where.
+O diretório é automaticamente compactado em .tar.gz antes da transferência.
 
-```sh
-p2pshare -ledger-show
+**Receptor:**
+```bash
+./p2pshare -listen :4444 -recv
 ```
 
+**Remetente:**
+```bash
+./p2pshare -connect 192.168.1.10:4444 -send ./meu-projeto/
 ```
-#0 [2026-06-28 00:21:13] OK  role=sender   peer=c13c0c18bf4caf8b  file="report.pdf" size=2048312  block=50bc39190983ac63
-#1 [2026-06-28 00:21:30] OK  role=receiver peer=8f202fd90e47a239  file="notes.txt"  size=58       block=58fe25e59fda3872
-
-✅ Chain integrity verified — all entries linked correctly.
-```
-
-The ledger lives at `$XDG_STATE_HOME/p2pshare/ledger.bin` (defaulting to
-`~/.local/state/p2pshare/ledger.bin`) and records, per entry: timestamp,
-role, the remote peer's public key, filename, size, and the transfer's
-final hash-chain value. It's an audit trail, not part of the transfer
-protocol — a failed write to the ledger is logged to stderr and never
-aborts an otherwise-successful transfer.
 
 ---
 
-## Design notes
+### 3. Receptor Envia, Conector Recebe (NAT)
 
-**Why ephemeral keys?** Persistent keys require secure storage and a trust-on-first-use model. Ephemeral keys sidestep both problems: the security guarantee is "I spoke to whoever was listening on that address right now," which is the correct model for ad-hoc transfers on a trusted local network or VPN.
+Útil quando o remetente está atrás de NAT e o receptor tem IP público.
 
-**Why ed25519 for both auth and encryption?** ed25519 is a signing scheme, not a KEM. The trick is the birational map between the Edwards curve (ed25519) and the Montgomery curve (Curve25519 / X25519): given the same seed, you can derive both a signing key and a Diffie-Hellman key. This means one keypair serves both purposes with no extra key material.
+**Remetente (escuta com arquivo):**
+```bash
+./p2pshare -listen :4444 -send ./backup.tar.gz
+```
 
-**Why AES-256-GCM instead of ChaCha20-Poly1305?** ChaCha20-Poly1305 requires `golang.org/x/crypto`, which is an external dependency. AES-256-GCM is in the Go stdlib (`crypto/aes` + `crypto/cipher`) and hardware-accelerated on any modern CPU with AES-NI.
-
-**Frame size cap** — frames larger than 128 MiB are rejected to prevent memory exhaustion from a malicious peer. Files larger than 128 MiB are split into 1 MiB chunks automatically.
-
----
-
-## What it does not do
-
-- Key pinning / TOFU — there is no way to verify you connected to the same peer as last time (by design, since keys are ephemeral)
-- Resume / partial transfer
-- Multi-file or directory transfer
-- Relay or NAT traversal (use a VPN or SSH tunnel if needed)
-- Compression
+**Receptor (conecta e recebe):**
+```bash
+./p2pshare -connect 200.100.50.10:4444 -recv
+```
 
 ---
 
-## License
+### 4. Com Compactação Ativada
+
+Comprime o arquivo antes de enviar (útil para arquivos de texto ou dados compressíveis).
+
+**Remetente:**
+```bash
+./p2pshare -connect 192.168.1.10:4444 -send ./log.txt -compress
+```
+
+---
+
+### 5. Com Autenticação PSK (Pre-Shared Key)
+
+Adiciona uma camada extra de segurança com senha pré-compartilhada.
+
+**Receptor:**
+```bash
+./p2pshare -listen :4444 -recv -psk minhaSenhaSecreta
+```
+
+**Remetente:**
+```bash
+./p2pshare -connect 192.168.1.10:4444 -send ./arquivo.txt -psk minhaSenhaSecreta
+```
+
+---
+
+### 6. Configurando Timeouts
+
+Para redes lentas ou instáveis, aumente os timeouts.
+
+**Receptor:**
+```bash
+./p2pshare -listen :4444 -recv -handshake-timeout 60s -read-timeout 120s -idle-timeout 5m
+```
+
+**Remetente:**
+```bash
+./p2pshare -connect 192.168.1.10:4444 -send ./video.mp4 -write-timeout 120s
+```
+
+---
+
+### 7. Logs em Formato JSON
+
+Para integração com ferramentas de monitoramento.
+
+**Receptor:**
+```bash
+./p2pshare -listen :4444 -recv -log-json -log-level debug
+```
+
+---
+
+### 8. Desabilitar Barra de Progresso
+
+Para scripts ou automação.
+
+**Remetente:**
+```bash
+./p2pshare -connect 192.168.1.10:4444 -send ./dados.csv -progress=false
+```
+
+---
+
+### 9. Verificar Ledger de Transferências
+
+Exibe o histórico de todas as transferências realizadas.
+
+```bash
+./p2pshare -ledger-show
+```
+
+---
+
+### 10. Cenário Completo com Todas as Opções
+
+**Receptor (com todas as opções):**
+```bash
+./p2pshare -listen :4444 -recv -psk minhaSenha -compress -log-json -progress -handshake-timeout 60s
+```
+
+**Remetente (com todas as opções):**
+```bash
+./p2pshare -connect 192.168.1.10:4444 -send ./diretorio/ -compress -psk minhaSenha -log-json -progress -write-timeout 120s
+```
+
+---
+
+### 🧪 Teste Rápido (Localhost)
+
+Para testar localmente, abra dois terminais:
+
+**Terminal 1 (Receptor):**
+```bash
+./p2pshare -listen :4444 -recv
+```
+
+**Terminal 2 (Remetente):**
+```bash
+echo "Conteúdo de teste" > teste.txt
+./p2pshare -connect localhost:4444 -send ./teste.txt
+```
+
+Após a transferência, o arquivo `teste.txt` aparecerá no diretório do receptor.
+
+---
+
+## ⚙️ Flags Reference
+
+| Flag | Description | Default |
+|:-----|:------------|:--------|
+| `-listen <addr>` | Bind and accept one connection | - |
+| `-connect <addr>` | Connect to a listening peer | - |
+| `-send <path>` | File or directory to send | - |
+| `-recv` | Receive a file | false |
+| `-compress` | Compress file before sending (gzip) | false |
+| `-psk <key>` | Pre-Shared Key for authentication | - |
+| `-handshake-timeout <dur>` | Handshake timeout | 30s |
+| `-read-timeout <dur>` | Read timeout | 60s |
+| `-write-timeout <dur>` | Write timeout | 60s |
+| `-idle-timeout <dur>` | Idle timeout | 2m |
+| `-log-json` | JSON formatted logs | false |
+| `-log-level <level>` | Log level (debug, info, warn, error) | info |
+| `-progress` | Show progress bar | true |
+| `-ledger-show` | Show transfer ledger | - |
+
+---
+
+## 🏗️ Architecture
+
+```
+p2pshare/
+├── main.go          # Entry point, orchestration
+├── config.go        # Configuration and flags
+├── progress.go      # Progress bar
+├── archive.go       # Directory support (tar.gz)
+├── psk.go           # Pre-Shared Key authentication
+├── logger.go        # Structured logging
+└── compress.go      # Optional compression
+```
+
+---
+
+## 🔧 Development
+
+### Build
+
+```bash
+go build -o p2pshare .
+```
+
+### Run Tests
+
+```bash
+go test ./...
+```
+
+### Cross-compile
+
+```bash
+GOOS=linux GOARCH=amd64 go build -o p2pshare-linux-amd64 .
+GOOS=darwin GOARCH=arm64 go build -o p2pshare-macos-arm64 .
+GOOS=windows GOARCH=amd64 go build -o p2pshare-windows-amd64.exe .
+```
+
+---
+
+## 🔒 Dicas de Segurança
+
+1. **Use PSK** em redes não confiáveis para autenticação adicional.
+2. **Verifique o ledger** periodicamente para auditoria: `./p2pshare -ledger-show`.
+3. **Chaves efêmeras** são geradas a cada execução, garantindo perfect forward secrecy.
+4. **Confie no peer** — não há verificação de identidade persistente (por design).
+
+---
+
+## 📝 Changelog
+
+### v2.0.0 (2026-08-21)
+
+**New Features:**
+- 📁 Directory support (automatic .tar.gz compression)
+- 📊 Progress bar with speed and ETA
+- ⏱️ Configurable timeouts (handshake, read, write, idle)
+- 🔑 PSK (Pre-Shared Key) authentication
+- 📝 Structured logging (JSON format)
+- 🗜️ Optional gzip compression
+- 🎨 Improved CLI with flags
+
+**Improvements:**
+- Modular architecture
+- Better error handling
+- Enhanced logging
+
+---
+
+## 📄 License
 
 MIT
+
+---
+
+Made with ❤️ for secure, ephemeral file sharing.
